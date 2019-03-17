@@ -1,5 +1,5 @@
 // bloom.go - Bloom filter.
-// Written in 2015 by Yawning Angel
+// Written in 2015 by Yawning Angel; 2019 by Will Scott
 //
 // To the extent possible under law, the author(s) have dedicated all copyright
 // and related and neighboring rights to this software to the public domain
@@ -13,71 +13,48 @@ package bloom
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"math"
+	"math/bits"
 	"strconv"
 
 	"github.com/dchest/siphash"
 )
 
-const (
-	maxNrHashes = 32
-	ln2         = 0.69314718055994529
-)
-
-// Filter is a bloom filter.
+// Filter is a delta-compressable bloom filter.
+// following the logic from http://www.eecs.harvard.edu/~michaelm/NEWWORK/postscripts/cbf2.pdf
 type Filter struct {
-	b        []byte
-	hashMask uint64
+	b        [][]byte
 
 	k1, k2 uint64
 
-	nrHashes     int
+	mask uint64
 	nrEntriesMax int
-	nrEntries    int
+	nrEntries    []int
 }
 
-// DeriveSize returns the size of a filter (as a power of 2) in bits,
-// required to hold at least n entries with a p false positive rate.
-//
-// The returned value is directly suitable for use as the mLn2 parameter
-// passed to New().
-func DeriveSize(n int, p float64) int {
-	if n <= 0 {
-		panic("negative number of entries")
-	}
-	if p <= 0.0 || p >= 1.0 {
-		panic("invalid false positive rate")
-	}
-	m := (float64(n) * math.Log(p)) / math.Log(1.0/math.Pow(2.0, ln2))
-	return int(math.Ceil(math.Log2(m)))
-}
-
-// New constructs a new Filter with a filter set size 2^mLn2 bits, and false
-// postive rate p.
-func New(rand io.Reader, mLn2 int, p float64) (*Filter, error) {
-	const (
-		ln2Sq   = 0.48045301391820139
-		maxMln2 = strconv.IntSize - 1
-	)
+// New constructs a new Filter with a filter set size of 2^mLn2
+// which allows an entry factor up to load before dropping layers
+// at new deltas.
+func New(rand io.Reader, mLn2 int, load float64) (*Filter, error) {
+	const maxMln2 = strconv.IntSize - 1
 
 	var key [16]byte
 	if _, err := io.ReadFull(rand, key[:]); err != nil {
 		return nil, err
 	}
 
-	if p <= 0.0 || p >= 1.0 {
-		return nil, fmt.Errorf("invalid false positive rate: %v", p)
+	if load <= 0.0 || load > 1.0 {
+		return nil, fmt.Errorf("invalid load rate: %v", load)
 	}
 
 	if mLn2 > maxMln2 {
 		return nil, fmt.Errorf("requested filter too large: %d", mLn2)
 	}
 
-	m := 1 << uint64(mLn2)
-	n := -1.0 * float64(m) * ln2Sq / math.Log(p)
-	k := int((float64(m) * ln2 / n) + 0.5)
+	m := uint64(1 << uint64(mLn2))
+	n := float64(m) * load
 
 	if uint64(n) > (1 << uint(maxMln2)) {
 		return nil, fmt.Errorf("requested filter too large (nrEntriesMax overflow): %d", mLn2)
@@ -86,15 +63,10 @@ func New(rand io.Reader, mLn2 int, p float64) (*Filter, error) {
 	f := new(Filter)
 	f.k1 = binary.BigEndian.Uint64(key[0:8])
 	f.k2 = binary.BigEndian.Uint64(key[8:16])
+	f.mask = m - 1
 	f.nrEntriesMax = int(n)
-	f.nrHashes = k
-	f.hashMask = uint64(m - 1)
-	if f.nrHashes < 2 {
-		f.nrHashes = 2
-	} else if f.nrHashes > maxNrHashes {
-		return nil, fmt.Errorf("requested parameters need too many hashes")
-	}
-	f.b = make([]byte, m/8)
+	f.b = [][]byte{make([]byte, m/8)}
+	f.nrEntries = make([]int, 1)
 	return f, nil
 }
 
@@ -106,62 +78,86 @@ func (f *Filter) MaxEntries() int {
 // Entries returns the number of entries that have been inserted into the
 // Filter.
 func (f *Filter) Entries() int {
-	return f.nrEntries
+	entries := 0
+	for i := 0; i < len(f.nrEntries); i++ {
+		entries += f.nrEntries[i]
+	}
+	return entries
 }
 
 // TestAndSet tests the Filter for a given value's membership, adds the value
 // to the filter, and returns true iff it was present at the time of the call.
 func (f *Filter) TestAndSet(b []byte) bool {
-	var hashes [maxNrHashes]uint64
-	f.getHashes(b, &hashes)
-
+	h := f.hash(b)
 	// Just return true iff the entry is present.
-	if f.test(&hashes) {
+	if f.test(h) {
 		return true
 	}
 
 	// Add and return false.
-	f.add(&hashes)
-	f.nrEntries++
+	f.add(h)
+	f.nrEntries[0]++
 	return false
+}
+
+func (f *Filter) Import(layer []byte) error {
+	if len(layer) != len(f.b[0]) {
+		return errors.New("Invalid layer size")
+	}
+	f.b = append([][]byte{layer}, f.b...)
+	c := f.count(layer)
+	f.nrEntries = append([]int{c}, f.nrEntries...)
+	f.checkExpiry()
+	return nil
+}
+
+func (f *Filter) Delta() []byte {
+	newLayer := make([]byte, len(f.b[0]))
+	f.b = append([][]byte{newLayer}, f.b...)
+	f.nrEntries = append([]int{0}, f.nrEntries...)
+	f.checkExpiry()
+	return f.b[1]
 }
 
 // Test tests the Filter for a given value's membership and returns true iff
 // it is present (or a false positive).
 func (f *Filter) Test(b []byte) bool {
-	var hashes [maxNrHashes]uint64
-	f.getHashes(b, &hashes)
-
-	return f.test(&hashes)
+	return f.test(f.hash(b))
 }
 
-func (f *Filter) getHashes(b []byte, hashes *[maxNrHashes]uint64) {
-	// Per "Less Hashing, Same Performance: Building a Better Bloom Filter"
-	// (Kirsch and Miteznmacher), with a suitably good PRF, only two calls to
-	// the hash algorithm are needed.  This is done with the "experimental"
-	// 128 bit digest variant of SipHash, split into 2 64 bit unsigned
-	// integers.
 
-	hashes[0], hashes[1] = siphash.Hash128(f.k1, f.k2, b)
-	for i := 2; i < f.nrHashes; i++ {
-		hashes[i] = hashes[0] + uint64(i)*hashes[1]
+func (f *Filter) count(b []byte) int {
+	var cnt int
+	for i := 0; i < len(b); i++ {
+		cnt += bits.OnesCount8(b[i])
+	}
+	return cnt
+}
+
+func (f *Filter) checkExpiry() {
+	ecnt := len(f.nrEntries)
+	ecntM := float64(ecnt + 1) / float64(ecnt)
+	if float64(f.Entries()) * ecntM >= float64(f.MaxEntries()) {
+		f.nrEntries = f.nrEntries[:ecnt-1]
+		f.b = f.b[:ecnt-1]
 	}
 }
 
-func (f *Filter) test(hashes *[maxNrHashes]uint64) bool {
-	for i := 0; i < f.nrHashes; i++ {
-		idx := hashes[i] & f.hashMask
-		if 0 == f.b[idx/8]&(1<<(idx&7)) {
-			// Break out early if there is a miss.
-			return false
+func (f *Filter) hash(b []byte) uint64 {
+	h, _ := siphash.Hash128(f.k1, f.k2, b)
+	h &= f.mask
+	return h
+}
+
+func (f *Filter) test(hash uint64) bool {
+	for i := 0; i < len(f.b); i++ {
+		if 0 != f.b[i][hash/8]&(1<<(hash&7)) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
-func (f *Filter) add(hashes *[maxNrHashes]uint64) {
-	for i := 0; i < f.nrHashes; i++ {
-		idx := hashes[i] & f.hashMask
-		f.b[idx/8] |= (1 << (idx & 7))
-	}
+func (f *Filter) add(hash uint64) {
+	f.b[0][hash/8] |= (1 << (hash & 7))
 }

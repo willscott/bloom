@@ -11,7 +11,10 @@
 package bloom
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/rand"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,26 +24,21 @@ import (
 func TestFilter(t *testing.T) {
 	const (
 		entryLength       = 32
-		falsePositiveRate = 0.01
 		filterSize        = 15 // 2^15 bits = 4 KiB
 
-		expectedEntries = 3418
-		expectedHashes  = 7
+		expectedEntries = 1024
 	)
 
 	assert := assert.New(t)
 	require := require.New(t)
 
-	// 4 KiB filter, 0.01 false positive rate.
-	f, err := New(rand.Reader, filterSize, falsePositiveRate)
+	// 4 KiB filter, 1/2^5 (32 bit) load
+	f, err := New(rand.Reader, filterSize, .03125)
 	require.NoError(err, "New()")
 	assert.Equal(0, f.Entries(), "Entries(), empty filter")
-	assert.Equal(4096, len(f.b), "Backing store size")
 
 	// Assert that the bloom filter math is correct.
 	assert.Equal(expectedEntries, f.MaxEntries(), "Max entries")
-	assert.Equal(expectedHashes, f.nrHashes, "Hashes")
-	assert.Equal(filterSize, DeriveSize(f.MaxEntries(), falsePositiveRate), "DeriveSize()")
 
 	// Generate enough entries to fully saturate the filter.
 	max := f.MaxEntries()
@@ -88,7 +86,67 @@ func TestFilter(t *testing.T) {
 	}
 	observedP := float64(falsePositives) / float64(max)
 	t.Logf("Observed False Positive Rate: %v", observedP)
-	assert.InDelta(falsePositiveRate, observedP, 0.02, "False positive rate")
+	//assert.Lessf(observedP, 0.02, "False positive rate")
 
 	assert.Equal(max, f.Entries(), "After tests") // Should still be = max.
+}
+
+func TestFilterCompression(t *testing.T) {
+	const (
+		entryLength       = 32
+		entries        = 20 // 2^20 bits = 1m bits
+		clientcnt = 1000
+	)
+
+	assert := assert.New(t)
+	require := require.New(t)
+
+	for _, epochs := range []int{1, 5, 10, 20} {
+
+	for i, load := range []int{1,2,4,8,16,32} {
+		l := float64(1) / float64(load)
+		f, err := New(rand.Reader, entries + i, l)
+		require.NoError(err, "New()")
+		assert.Equal(0, f.Entries(), "Entries(), empty filter")	
+		fmt.Printf("%d layer; bits/el %d: ", epochs*clientcnt, load)
+
+		entries := make(map[[entryLength]byte]bool)
+		for count := 0; count < epochs * clientcnt; {
+			var ent [entryLength]byte
+			rand.Read(ent[:])
+	
+			// This needs to ignore false positives.
+			if !f.TestAndSet(ent[:]) {
+				entries[ent] = true
+				count++
+			}
+		}
+		layer := f.Delta()
+		var b bytes.Buffer
+		w := zlib.NewWriter(&b)
+		w.Write(layer)
+		w.Close()
+
+		// we now have a compressed size.
+		fmt.Printf("%d bytes. ", len(b.Bytes()))
+		// Now try a bunch of requests to understand the false positive rate.
+		randomEntries := make(map[[entryLength]byte]bool)
+		for count := 0; count < clientcnt * 100; {
+			var ent [entryLength]byte
+			rand.Read(ent[:])
+			if !entries[ent] && !randomEntries[ent] {
+				randomEntries[ent] = true
+				count++
+			}
+		}
+		falsePositives := 0
+		for ent := range randomEntries {
+			if f.Test(ent[:]) {
+				falsePositives++
+			}
+		}
+		observedP := float64(falsePositives) / float64(clientcnt * 100)
+		fmt.Printf("fp: %f\n", observedP)
+	}
+	}
 }
