@@ -1,4 +1,4 @@
-module github.com/Yawning/bloom
+module github.com/willscott/bloom
 
 require (
 	github.com/dchest/siphash v1.2.1
